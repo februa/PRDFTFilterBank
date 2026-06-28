@@ -1,0 +1,5 @@
+__pycache__/
+outputs/
+.pytest_cache/
+pytest-cache-files-*/
+*.pyc
