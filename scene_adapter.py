@@ -29,7 +29,7 @@ class ArrayConfig:
 
 @dataclass(frozen=True)
 class SignalConfig:
-    frequency_hz: float = 10000.0
+    frequency_hz: float = 1000.0
     bearing_deg: float = 60.0
     distance_m: float = 1000.0
     rms_amplitude: float = 1.0
@@ -66,6 +66,8 @@ class SimulationConfig:
     n_bands: int = 32
     n_used_bands: int = 16
     decimation: int = 32
+    prototype_taps_per_band: int = 8
+    prototype_beta: float = 1.0
     array: ArrayConfig = field(default_factory=ArrayConfig)
     signal: SignalConfig = field(default_factory=SignalConfig)
     noise: NoiseConfig = field(default_factory=NoiseConfig)
@@ -148,6 +150,8 @@ class SimulationConfig:
             n_bands=self.n_bands,
             n_used_bands=self.n_used_bands,
             decimation=self.decimation,
+            prototype_taps_per_band=self.prototype_taps_per_band,
+            prototype_beta=self.prototype_beta,
         )
 
     @property
@@ -162,6 +166,8 @@ class SimulationConfig:
             "n_bands": self.n_bands,
             "n_used_bands": self.n_used_bands,
             "band_width_hz": self.filterbank.band_width,
+            "subband_rate_hz": self.filterbank.subband_rate,
+            "prototype_length": self.filterbank.prototype_length,
             "source_frequency_hz": self.signal.frequency_hz,
             "source_bearing_deg": self.signal.bearing_deg,
             "source_rms_amplitude": self.signal.rms_amplitude,
@@ -243,31 +249,29 @@ def run_subband_beamforming(
     positions: np.ndarray,
     config: SimulationConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = np.asarray(x, dtype=np.complex128)
+    x = np.asarray(np.real(x), dtype=np.float64)
     positions = np.asarray(positions, dtype=float)
+    if x.ndim != 2:
+        raise ValueError("x must have shape (n_ch, n_sample)")
     if x.shape[-1] != config.block_size:
         raise ValueError("This implementation expects one block per run")
 
     filterbank = PRDFTFilterBank(config.filterbank)
     beam_angles_deg = config.beamformer.beam_angles_deg()
 
-    _ = filterbank.analysis(x)
-
-    full_spectrum = np.fft.rfft(np.real(x), axis=-1)
-    positive_bins = config.filterbank.n_used_bands * int(config.filterbank.band_width)
-    band_bin_count = int(config.filterbank.band_width)
-    positive_spectrum = full_spectrum[:, :positive_bins].reshape(
-        config.n_ch,
-        config.filterbank.n_used_bands,
-        band_bin_count,
-    )
+    x_subbands = filterbank.analysis(x)
+    x_positive = filterbank.positive_bands(x_subbands)
+    n_frame = x_positive.shape[-1]
+    local_freq_hz = filterbank.local_frequency_axis(n_frame)
+    positive_centers_hz = filterbank.positive_band_centers_hz
 
     y_positive_spectrum = np.zeros(
-        (config.n_beams, config.filterbank.n_used_bands, band_bin_count),
+        (config.n_beams, config.filterbank.n_used_bands, n_frame),
         dtype=np.complex128,
     )
-    for band in range(config.filterbank.n_used_bands):
-        absolute_freq_hz = band * config.filterbank.band_width + np.arange(band_bin_count, dtype=float)
+    for band, center_hz in enumerate(positive_centers_hz):
+        x_band_spectrum = np.fft.fft(x_positive[:, band, :], axis=-1)
+        absolute_freq_hz = center_hz + local_freq_hz
         steering = steering_vector(
             positions=positions,
             angles_deg=beam_angles_deg,
@@ -278,12 +282,12 @@ def run_subband_beamforming(
         y_positive_spectrum[:, band, :] = np.einsum(
             "bcf,cf->bf",
             weights,
-            positive_spectrum[:, band, :],
+            x_band_spectrum,
             optimize=True,
         )
 
     y_positive_time = np.fft.ifft(y_positive_spectrum, axis=-1)
-    y_full_spectrum = np.zeros((config.n_beams, config.block_size // 2 + 1), dtype=np.complex128)
-    y_full_spectrum[:, :positive_bins] = y_positive_spectrum.reshape(config.n_beams, positive_bins)
-    y_time = np.fft.irfft(y_full_spectrum, n=config.block_size, axis=-1)
+    y_full_spectrum = filterbank.restore_full_band_spectra(y_positive_spectrum)
+    y_full_subbands = np.fft.ifft(y_full_spectrum, axis=-1)
+    y_time = np.real(filterbank.synthesis(y_full_subbands))
     return y_time, y_positive_time, beam_angles_deg

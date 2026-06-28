@@ -1,6 +1,6 @@
 # PRDFTFilterBank MATLAB実装設計書
 
-Version: 0.2
+Version: 0.3
 
 ---
 
@@ -9,40 +9,52 @@ Version: 0.2
 本書は、MATLAB 上で
 
 - 解析から合成まで完全に decimated subband 処理で閉じる
-- PR 指向の DFT 変調フィルタバンクを使う
+- 複素変調 + 低域 FIR + decimation/interpolation を使う
 - 各サブ帯域で delay-and-sum beamforming を行う
 
 ための実装設計を整理したものである。
 
-ここでいう「decimated subband 処理で閉じる」とは、解析フィルタバンクで低レートのサブ帯域時系列へ落とした後、
-
-- サブ帯域内 FFT
-- サブ帯域ビームフォーミング
-- サブ帯域内 IFFT
-- 合成フィルタバンク
-
-まで、フルレートの `32768` 点 FFT / IFFT に戻らずに処理することを意味する。
+本書は、現在の Python 実装の構造に合わせて更新した版である。
 
 ---
 
-# 2. 今回やりたい方式と現在の Python 実装の違い
+# 2. 実装方式
 
-## 2.1 やりたい方式
+## 2.1 現在の Python 実装と合わせる前提
 
-実装したい本来の処理は以下である。
+現在の Python 実装は、各帯域について
+
+1. 複素変調で帯域中心を 0 Hz へ落とす
+2. 低域 FIR をかける
+3. decimation する
+4. サブ帯域内 FFT / beamforming / IFFT を行う
+5. interpolation する
+6. 同じ低域 FIR をかける
+7. 複素逆変調で元帯域へ戻す
+8. 全帯域を加算する
+
+という構成である。
+
+MATLAB 実装もまずこの構成に合わせる。
+
+## 2.2 処理フロー
 
 ```text
-x_m[n]
-  -> analysis polyphase / DFT FB
+x(m, n)
+  -> analysis modulation
+  -> lowpass FIR
+  -> decimation
 x_sb(m, k, r)
-  -> 帯域ごとの時間方向 FFT
+  -> subband FFT
 X_sb(m, k, q)
-  -> 帯域ごとの beamforming
+  -> beamforming
 Y_sb(b, k, q)
-  -> 帯域ごとの時間方向 IFFT
+  -> subband IFFT
 y_sb(b, k, r)
-  -> synthesis polyphase / IDFT FB
-y_b[n]
+  -> interpolation
+  -> lowpass FIR
+  -> synthesis modulation
+y(b, n)
 ```
 
 ここで
@@ -50,99 +62,37 @@ y_b[n]
 - `m`: channel index
 - `b`: beam index
 - `k`: subband index
-- `n`: 元のフルレート時間 index
-- `r`: decimation 後の低レート時間 index
-- `q`: サブ帯域内 FFT bin index
+- `n`: フルレート時間 index
+- `r`: decimation 後の subband 時間 index
+- `q`: subband FFT bin index
 
 である。
 
-## 2.2 現在の Python 実装
-
-現在の Python 実装は、理論確認を優先して、実質的に
-
-```text
-x[n]
-  -> 32768点 rFFT
-  -> 16帯域へ切り分け
-  -> 帯域ごとに重み付け
-  -> 32768点 irFFT
-  -> y[n]
-```
-
-に近い。
-
-つまり現在の Python 実装は
-
-- ビーム応答の成立確認には有効
-- 低レート subband 実装の計算量削減をそのまま実現しているわけではない
-
-という位置付けである。
-
-## 2.3 MATLAB で目指す実装
-
-MATLAB では、上記 Python の簡易化は捨てて、
-
-```text
-analysis FB -> decimated subband -> subband processing -> synthesis FB
-```
-
-をそのまま実装する。
-
 ---
 
-# 3. 処理全体フロー
+# 3. システムパラメータ
 
-```text
-入力時間信号
-x(m, n)                          size = (Mch, N)
-
-解析フィルタバンク
-x_sb(m, k, r)                    size = (Mch, K, Nr)
-
-各サブ帯域の時間方向 FFT
-X_sb(m, k, q)                    size = (Mch, Kuse, Nr)
-
-各サブ帯域・各周波数 bin で beamforming
-Y_sb(b, k, q)                    size = (Nbeam, Kuse, Nr)
-
-各サブ帯域の時間方向 IFFT
-y_sb(b, k, r)                    size = (Nbeam, Kuse, Nr)
-
-未使用帯域を 0 として全帯域へ戻す
-y_sb_full(b, k, r)               size = (Nbeam, K, Nr)
-
-合成フィルタバンク
-y(b, n)                          size = (Nbeam, N)
-
-評価 FFT
-Y_eval(b, f)
-```
-
----
-
-# 4. システムパラメータ
-
-## 4.1 基本条件
+## 3.1 基本条件
 
 ```matlab
 fs = 32768;
 block_rate = 1;
-N = fs / block_rate;      % 32768
+N = fs / block_rate;          % 32768
 c = 1500;
 ```
 
-## 4.2 フィルタバンク条件
+## 3.2 フィルタバンク条件
 
 ```matlab
-K = 32;                   % 総帯域数
-Kuse = 16;                % 利用帯域数
-D = 32;                   % decimation
-Nr = N / D;               % subband time length = 1024
-band_width = fs / K;      % 1024 Hz
-fs_sb = fs / D;           % 1024 Hz
+K = 32;
+Kuse = 16;
+D = 32;
+Nr = N / D;                   % 1024
+band_width = fs / K;          % 1024 Hz
+fs_sb = fs / D;               % 1024 Hz
 ```
 
-## 4.3 アレイ条件
+## 3.3 アレイ条件
 
 ```matlab
 Mch = 32;
@@ -151,7 +101,7 @@ idx = 0:Mch-1;
 xpos = (idx - mean(idx)) * spacing;
 ```
 
-## 4.4 信号条件
+## 3.4 信号条件
 
 ```matlab
 f0 = 1000;
@@ -160,80 +110,134 @@ a_rms = 1.0;
 a_peak = sqrt(2) * a_rms;
 ```
 
-## 4.5 ビーム条件
+## 3.5 ビーム条件
 
 ```matlab
 Nbeam = 181;
 beam_angle_deg = acosd(linspace(1, -1, Nbeam));
 ```
 
-## 4.6 prototype filter 条件
+## 3.6 prototype 条件
 
-完全 PR を厳密にやるなら prototype filter 設計が本体になる。まずは MATLAB 実装初版として、
-
-- DFT 変調フィルタバンク
-- `K = D = 32`
-- prototype 長 `Lp = P * K`
-- `P = 2, 4, 8` のいずれか
-
-を明示的に決める。
-
-推奨初期値:
+現在の Python 既定値に合わせるなら
 
 ```matlab
-P = 4;
-Lp = P * K;               % 128
+taps_per_band = 8;
+beta = 1.0;
+Lp = D * taps_per_band + 1;   % 257
 ```
 
-この prototype は後で置き換えられるよう、独立パラメータとして持つこと。
+品質寄りで始めたいなら
+
+```matlab
+taps_per_band = 16;
+beta = 1.0;
+Lp = 513;
+```
+
+も候補になる。
 
 ---
 
-# 5. 配列形状
+# 4. prototype filter 設計
 
-## 5.1 入力信号
+## 4.1 現在の Python 実装と同じ式
+
+prototype `h[p]` は Kaiser 窓付き sinc で以下のように作る。
+
+```matlab
+n = (0:Lp-1) - (Lp-1)/2;
+fc_norm = 0.5 / D;
+h = 2 * fc_norm * sinc(2 * fc_norm * n) .* kaiser(Lp, beta).';
+```
+
+ここで `sinc(x)` は MATLAB の正規化 sinc を使うか、自前定義をそろえる。
+
+## 4.2 意味
+
+- cutoff は `fs / (2D)` 相当
+- 複素変調後の低域成分だけを通す
+- その後 decimation する
+
+## 4.3 設計パラメータ
+
+prototype の主要パラメータは
+
+- `taps_per_band`
+- `beta`
+
+の 2 つである。
+
+処理量と関係は [prototype_taps_vs_cost.md](C:/Users/febru/Documents/workspace/projects/github/PRDFTFilterBank/doc/prototype_taps_vs_cost.md) を参照。
+
+---
+
+# 5. 帯域中心周波数
+
+現在の Python 実装では帯域中心は以下で定義している。
+
+```matlab
+band_centers = (0:K-1) * band_width;
+band_centers(band_centers >= fs/2) = band_centers(band_centers >= fs/2) - fs;
+```
+
+したがって `K=32` では
+
+```text
+0, 1024, 2048, ..., 15360, -16384, -15360, ..., -1024
+```
+
+となる。
+
+正帯域として利用するのは前半 `Kuse=16` 帯域である。
+
+---
+
+# 6. 配列形状
+
+## 6.1 入力信号
 
 ```text
 x(m, n)                   size = (Mch, N)
 ```
 
-## 5.2 解析後 subband 時系列
+## 6.2 解析後 subband 時系列
 
 ```text
 x_sb(m, k, r)             size = (Mch, K, Nr)
 ```
 
-## 5.3 利用帯域のみ抜き出し
+## 6.3 利用帯域
 
 ```text
 x_use(m, k, r)            size = (Mch, Kuse, Nr)
 ```
 
-## 5.4 サブ帯域内 FFT 後
+## 6.4 サブ帯域内 FFT 後
 
 ```text
 X_use(m, k, q)            size = (Mch, Kuse, Nr)
 ```
 
-## 5.5 ビーム形成後スペクトル
+## 6.5 ビーム形成後スペクトル
 
 ```text
 Y_use(b, k, q)            size = (Nbeam, Kuse, Nr)
 ```
 
-## 5.6 サブ帯域内 IFFT 後
+## 6.6 サブ帯域内 IFFT 後
 
 ```text
 y_use(b, k, r)            size = (Nbeam, Kuse, Nr)
 ```
 
-## 5.7 合成用の全帯域 subband 信号
+## 6.7 全帯域 subband 時系列
 
 ```text
 y_sb_full(b, k, r)        size = (Nbeam, K, Nr)
 ```
 
-## 5.8 合成後時間信号
+## 6.8 合成後時間信号
 
 ```text
 y(b, n)                   size = (Nbeam, N)
@@ -241,122 +245,80 @@ y(b, n)                   size = (Nbeam, N)
 
 ---
 
-# 6. 解析フィルタバンク設計
+# 7. 解析フィルタバンク設計
 
-# 6.1 役割
+## 7.1 基本式
 
-解析部は、フルレート時間信号 `x(m, n)` から、decimation 後の複素サブ帯域時系列 `x_sb(m, k, r)` を生成する。
+各帯域 `k` の中心周波数を `f_k` とする。
 
-## 6.2 基本式
-
-解析フィルタバンクは prototype `h[p]` を DFT 変調して構成する。
-
-解析フィルタ:
+入力 `x(m,n)` に対して
 
 ```text
-h_k[p] = h[p] * exp(-j 2π k p / K)
+x_mix(m, k, n) = x(m, n) exp(-j 2π f_k n / fs)
 ```
 
-解析出力:
+と複素変調する。
+
+その後、低域 FIR `h[p]` を通して
 
 ```text
-x_sb(m, k, r)
-= Σ_p h[p] * x(m, rD - p) * exp(-j 2π k p / K)
+x_lp(m, k, n) = Σ_p h[p] x_mix(m, k, n-p)
 ```
 
-これは直接計算してもよいが、MATLAB 実装では polyphase 化した方がよい。
+を得る。
 
-## 6.3 polyphase 形
-
-prototype `h[p]` を `K` 相に分ける。
+最後に `D` 点ごとに間引いて
 
 ```text
-h[p] -> e_l[u]
-where p = uK + l,  l = 0,...,K-1
+x_sb(m, k, r) = x_lp(m, k, rD)
 ```
 
-すなわち
+を得る。
+
+## 7.2 MATLAB 擬似コード
 
 ```matlab
-E = reshape(h, K, P);     % 実際の並びは要確認
+for k = 1:K
+    fk = band_centers(k);
+    mod = exp(-1j * 2*pi * fk * (0:N-1) / fs);
+
+    for m = 1:Mch
+        x_mix = x(m, :) .* mod;
+        x_lp = conv(x_mix, h, 'full');
+        x_sb(m, k, :) = x_lp(gd+1 : D : gd + Nr*D);
+    end
+end
 ```
 
-とし、各 decimation 時刻 `r` で必要な過去サンプル列を `K` 相に並べ、最後に `K` 点 DFT する。
+ここで
 
-概念的には
-
-```text
-v_l(m, r) = Σ_u e_l[u] * x(m, rD - (uK + l))
-x_sb(m, k, r) = Σ_l v_l(m, r) * exp(-j 2π k l / K)
+```matlab
+gd = (Lp - 1) / 2;
 ```
 
 である。
 
-## 6.4 MATLAB 実装イメージ
+## 7.3 注意点
 
-1. 入力を `D` サンプルごとに進める
-2. 各時刻で長さ `Lp` のバッファを取る
-3. polyphase 成分ごとに内積する
-4. 最後に `K` 点 FFT する
-
-擬似コード:
-
-```matlab
-for r = 1:Nr
-    n0 = (r-1) * D + 1;
-    seg = x(:, n0:n0+Lp-1);              % 実装ではゼロ詰めや遅延方向を要整理
-
-    for l = 1:K
-        for u = 1:P
-            v(:, l) = v(:, l) + E(l, u) * seg(:, ...);
-        end
-    end
-
-    x_sb(:, :, r) = fft(v, [], 2);
-end
-```
-
-実装では時間反転を含む畳み込み方向を厳密にそろえること。ここは MATLAB 実装時の最重要確認点の一つである。
-
-## 6.5 解析部の出力確認
-
-1000 Hz の単一トーンを入れたとき:
-
-- 主成分は第1帯域付近に出る
-- 隣接帯域漏れは prototype の性能に依存する
-- 出力時系列長は `Nr = 1024` になる
+- `conv(..., 'full')` の切り出し位置を固定すること
+- group delay を必ず吸収すること
+- `Nr = N/D` 個のサンプルを切り出すこと
 
 ---
 
-# 7. サブ帯域内ビームフォーミング設計
+# 8. サブ帯域内ビームフォーミング
 
-## 7.1 基本方針
+## 8.1 サブ帯域内 FFT
 
-解析出力 `x_sb(m, k, r)` は、すでに decimation 後の低レート信号である。
-
-この時点で 32768 点 FFT に戻ってはいけない。
-
-各帯域について、長さ `Nr = 1024` の時系列に対して時間方向 FFT を取る。
+利用帯域だけ抜き出して
 
 ```matlab
 X_use = fft(x_use, [], 3);
 ```
 
-## 7.2 サブ帯域内周波数軸
+とする。
 
-サブ帯域サンプリング周波数は
-
-```text
-fs_sb = fs / D = 1024 Hz
-```
-
-ゆえに、ローカル周波数軸は
-
-```text
-f_local[q] = q * fs_sb / Nr
-```
-
-ではなく、負周波数側を含む signed frequency に直す。
+## 8.2 ローカル周波数軸
 
 ```matlab
 q = 0:Nr-1;
@@ -365,397 +327,253 @@ f_local(q >= Nr/2) = f_local(q >= Nr/2) - Nr;
 f_local = f_local * fs_sb / Nr;
 ```
 
-この条件では `fs_sb / Nr = 1 Hz` なので
+今回の条件では
 
 ```text
-f_local = 0,1,...,511,-512,...,-1 [Hz]
+0,1,...,511,-512,...,-1 [Hz]
 ```
 
-である。
+となる。
 
-## 7.3 絶対周波数軸
+## 8.3 絶対周波数軸
 
-各帯域 `k` の中心周波数オフセットは
-
-```text
-f_offset[k] = k * band_width
-```
-
-とし、絶対周波数は
+帯域 `k` の絶対周波数は
 
 ```text
-f_abs(k, q) = f_offset[k] + f_local[q]
+f_abs(k, q) = f_center(k) + f_local(q)
 ```
 
 で与える。
 
-ここで `k = 0,1,...,Kuse-1` として扱う。
-
-## 7.4 steering vector
-
-チャネル位置 `xpos[m]`、ビーム角 `theta_b` に対し、遅延は
+## 8.4 steering vector
 
 ```text
-tau(m, b) = xpos[m] * cos(theta_b) / c
-```
-
-steering vector は
-
-```text
+tau(m, b) = xpos(m) cos(theta_b) / c
 a(m, b, k, q) = exp(-j 2π f_abs(k, q) tau(m, b))
 ```
 
-である。
-
-## 7.5 Delay-and-Sum
-
-重みは
+## 8.5 Delay-and-Sum
 
 ```text
 w(m, b, k, q) = conj(a(m, b, k, q)) / Mch
-```
-
-出力は
-
-```text
 Y_use(b, k, q) = Σ_m w(m, b, k, q) X_use(m, k, q)
 ```
 
-である。
-
-MATLAB 擬似コード:
-
-```matlab
-for k = 1:Kuse
-    for b = 1:Nbeam
-        tau = xpos * cosd(beam_angle_deg(b)) / c;
-        for q = 1:Nr
-            f = f_abs(k, q);
-            a = exp(-1j * 2*pi * f * tau);
-            w = conj(a) / Mch;
-            Y_use(b, k, q) = sum(w .* squeeze(X_use(:, k, q)).');
-        end
-    end
-end
-```
-
-## 7.6 サブ帯域時系列へ戻す
+## 8.6 サブ帯域時系列へ戻す
 
 ```matlab
 y_use = ifft(Y_use, [], 3);
 ```
 
-ここでも処理長は `Nr = 1024` のままである。
-
 ---
 
-# 8. 合成フィルタバンク設計
+# 9. 正帯域から全帯域への復元
 
-## 8.1 基本方針
+現在の Python 実装では、利用した正帯域スペクトル `Y_use` から、負帯域側を FFT 領域で共役鏡像復元している。
 
-使用しない帯域はゼロにして、全帯域の subband 時系列 `y_sb_full(b, k, r)` を作る。
-
-```matlab
-y_sb_full = zeros(Nbeam, K, Nr);
-y_sb_full(:, 1:Kuse, :) = y_use;
-```
-
-必要なら負周波数側帯域を共役対称で埋める。実信号復元を狙うなら、この帯域配置は解析側の定義と必ず整合させる。
-
-## 8.2 合成基本式
-
-合成フィルタ `g_k[p]` を用いて
-
-```text
-y_b[n] = Σ_k Σ_r y_sb_full(b, k, r) g_k[n - rD]
-```
-
-で復元する。
-
-DFT 変調表現では
-
-```text
-g_k[p] = g[p] * exp(+j 2π k p / K)
-```
-
-である。
-
-## 8.3 polyphase 合成形
-
-合成では、まず各 decimated 時刻 `r` で `K` 点 IFFT を行い、polyphase 成分へ戻し、その後 overlap-add する。
-
-概念式:
-
-```text
-u_l(b, r) = (1/K) Σ_k y_sb_full(b, k, r) exp(+j 2π k l / K)
-```
-
-その後
-
-```text
-y_b[n] = Σ_r Σ_l Σ_u u_l(b, r) s_l[u] δ[n - (rD + uK + l)]
-```
-
-ここで `s_l[u]` は synthesis prototype の polyphase 成分である。
-
-## 8.4 MATLAB 実装イメージ
-
-1. `ifft(..., [], 2)` で帯域方向 IFFT を行う
-2. 各相成分を synthesis polyphase filter で重み付けする
-3. `D` サンプル間隔で overlap-add する
-
-擬似コード:
+概念的には
 
 ```matlab
-for r = 1:Nr
-    u = ifft(y_sb_full(:, :, r), [], 2);
+Y_full = zeros(Nbeam, K, Nr);
+Y_full(:, 1:Kuse, :) = Y_use;
+Y_full(:, Kuse+1, :) = 0;
 
-    for l = 1:K
-        for p = 1:P
-            n0 = (r-1)*D + (p-1)*K + l;
-            y(:, n0) = y(:, n0) + S(l, p) * u(:, l);
-        end
-    end
+for k = 2:Kuse
+    Y_full(:, K-k+2, :) = conj(circshift(flip(Y_use(:, k, :), 3), 1, 3));
 end
 ```
 
-ここでも配列の並び、遅延方向、境界ゼロ詰めは必ず解析側と対で確認すること。
+のような扱いになる。
 
----
-
-# 9. 完全に decimated subband で閉じることの意味
-
-## 9.1 数式上の意味
-
-フル長処理では、主な FFT サイズは `N = 32768` である。
-
-一方、完全 decimated subband 処理では、解析後の主な処理サイズは
-
-```text
-Nr = N / D = 1024
-```
-
-へ落ち、その後の FFT / IFFT / beamforming は `Nr` ベースで進む。
-
-つまり主処理サイズが
-
-```text
-N -> N / D
-```
-
-へ圧縮されたまま最後まで維持される。
-
-## 9.2 Python 簡易実装との違い
-
-現在の Python 簡易版は
-
-```text
-x -> 32768点 rFFT -> 帯域分割 -> 重み付け -> 32768点 irFFT
-```
-
-であるため、入口と出口にまだ `O(N log N)` のフル長処理が残っている。
-
-MATLAB で目指す方式は
-
-```text
-x -> analysis FB -> low-rate subbands -> subband FFT/BF/IFFT -> synthesis FB -> y
-```
-
-であり、途中でフル長 FFT へ戻らない。
-
----
-
-# 10. 演算量の見方
-
-## 10.1 フルバンド方式
-
-FFT 項だけ見ると
-
-```text
-C_full ≈ (Mch + Nbeam) N log2 N
-```
-
-## 10.2 decimated subband 方式
-
-利用帯域 `Kuse` 本、各帯域長 `Nr = N/D` とすると
-
-```text
-C_sub ≈ Kuse (Mch + Nbeam) Nr log2 Nr
-```
-
-今回の条件では
-
-```text
-N = 32768
-Nr = 1024
-Kuse = 16
-```
-
-なので
-
-```text
-C_sub / C_full
-= Kuse * (Nr log2 Nr) / (N log2 N)
-= 16 * (1024 * 10) / (32768 * 15)
-= 1/3
-```
-
-となる。
-
-したがって FFT 項ベースでは
-
-```text
-約 66.7 % 軽減
-```
-
-である。
-
----
-
-# 11. 設計上の注意点
-
-## 11.1 prototype filter を独立設計にする
-
-本質は prototype である。解析/合成の整合が取れていないと、後段 beamforming が正しくても再構成で崩れる。
-
-## 11.2 解析と合成の polyphase 並び順を必ず固定する
-
-`reshape` だけで済ませると MATLAB の列優先並びで破綻しやすい。`l` 相、`u` tap、時間反転の定義を紙に書いて固定すること。
-
-## 11.3 帯域 index と絶対周波数の対応を固定する
-
-`k = 0` が `0-1024 Hz` の帯域を表すのか、中心周波数 `512 Hz` を表すのかを実装前に決めること。
-
-## 11.4 サブ帯域内 FFT の周波数軸は signed frequency にする
-
-後半ビンを負周波数として扱わないと steering vector が崩れる。
-
-## 11.5 使用しない帯域の扱いを明示する
-
-`Kuse = 16` だけ処理するなら、残り帯域は 0 にするのか、共役対称で埋めるのかを解析/合成定義と合わせること。
-
-## 11.6 RMS と peak を混同しない
-
-評価を RMS 基準で行うなら
+その後
 
 ```matlab
-a_peak = sqrt(2) * a_rms
+y_sb_full = ifft(Y_full, [], 3);
+```
+
+として全帯域 subband 時系列へ戻す。
+
+---
+
+# 10. 合成フィルタバンク設計
+
+## 10.1 基本式
+
+各帯域 `k` の subband 時系列 `y_sb(b, k, r)` を、まず `D` 倍 upsample する。
+
+```text
+y_up(b, k, n) = upsample(y_sb(b, k, r), D)
+```
+
+その後、同じ低域 FIR `h[p]` を通す。
+
+```text
+y_lp(b, k, n) = Σ_p h[p] y_up(b, k, n-p)
+```
+
+最後に複素逆変調する。
+
+```text
+y_mod(b, k, n) = y_lp(b, k, n) exp(+j 2π f_k n / fs)
+```
+
+全帯域を加算して
+
+```text
+y(b, n) = D Σ_k y_mod(b, k, n)
+```
+
+とする。
+
+## 10.2 MATLAB 擬似コード
+
+```matlab
+for k = 1:K
+    fk = band_centers(k);
+    mod = exp(+1j * 2*pi * fk * (0:N-1) / fs);
+
+    for b = 1:Nbeam
+        up = zeros(1, N);
+        up(1:D:end) = y_sb_full(b, k, :);
+        y_lp = conv(up, h, 'full');
+        y(b, :) = y(b, :) + D * y_lp(gd+1 : gd+N) .* mod;
+    end
+end
+
+y = real(y);
+```
+
+---
+
+# 11. 計算量の見方
+
+## 11.1 FIR 部分
+
+現在の構成では、FIR 長 `L = D * taps_per_band + 1` が支配的である。
+
+解析:
+
+```text
+C_analysis ∝ Mch * K * N * L
+```
+
+合成:
+
+```text
+C_synthesis ∝ Nbeam * K * N * L
+```
+
+したがって
+
+```text
+処理量 ∝ prototype_taps_per_band
+```
+
+と見てよい。
+
+詳細は [prototype_taps_vs_cost.md](C:/Users/febru/Documents/workspace/projects/github/PRDFTFilterBank/doc/prototype_taps_vs_cost.md) を参照。
+
+## 11.2 FFT 部分
+
+subband 内 FFT は
+
+```text
+Kuse * Nr log2 Nr
+```
+
+であり、フル長 `32768` 点 FFT を毎回使うより軽い。
+
+---
+
+# 12. 設計上の注意点
+
+## 12.1 振幅定義を隠さない
+
+```matlab
+a_rms = 1.0;
+a_peak = sqrt(2) * a_rms;
 ```
 
 を明示する。
 
-## 11.7 FFT 正規化は元のブロック長で行う
+## 12.2 group delay の切り出し位置を固定する
 
-最終 `Angle vs Level` 評価では
+解析と合成で `gd = (Lp-1)/2` を同じ意味で使うこと。
 
-```matlab
-A_peak = 2 * abs(Y(k0)) / N
-A_rms = A_peak / sqrt(2)
+## 12.3 ローカル周波数軸は signed frequency にする
+
+後半ビンを負周波数として扱わないと steering vector が崩れる。
+
+## 12.4 絶対周波数で steering を計算する
+
+```text
+f_abs = f_center + f_local
 ```
 
-を使う。
+を必ず使うこと。
+
+## 12.5 正帯域から負帯域を戻す規則を固定する
+
+共役鏡像の作り方が 1 サンプルずれると、実信号復元が崩れる。
+
+## 12.6 `prototype_taps_per_band` は品質と速度のトレードオフ
+
+- `8`: 軽い
+- `16`: バランス
+- `24`: 品質寄り
+
+という感触で設計を進める。
 
 ---
 
-# 12. 推奨関数分割
+# 13. 推奨関数分割
 
 ```text
 main_prdft_beamforming.m
 make_parameters.m
 design_prototype_filter.m
-analyze_pr_dft_fb.m
+analyze_modulated_subbands.m
 beamform_decimated_subbands.m
-synthesize_pr_dft_fb.m
+restore_full_subband_spectra.m
+synthesize_modulated_subbands.m
 evaluate_beam_response.m
 plot_beam_response.m
 ```
 
-役割:
+---
 
-- `design_prototype_filter.m`
-  - prototype filter 生成
-- `analyze_pr_dft_fb.m`
-  - `x(m,n) -> x_sb(m,k,r)`
-- `beamform_decimated_subbands.m`
-  - `x_sb -> X_use -> Y_use -> y_use`
-- `synthesize_pr_dft_fb.m`
-  - `y_sb_full -> y(b,n)`
+# 14. 実装順序
+
+1. パラメータ生成
+2. prototype filter 設計
+3. 解析部実装
+4. 解析->合成だけで PR 確認
+5. subband beamforming 実装
+6. 正帯域から全帯域復元
+7. 評価部実装
+8. 雑音付き確認
 
 ---
 
-# 13. 実装順序
+# 15. 最低限の確認項目
 
-## Step1
-
-パラメータ固定
-
-- `fs, N, K, D, Kuse, Nr, c`
-- `xpos`
-- `beam_angle_deg`
-- `P, Lp`
-
-## Step2
-
-prototype filter 設計
-
-- まずは1種類に固定
-- 単独で解析/合成の PR 性能を確認
-
-## Step3
-
-解析フィルタバンク実装
-
-- `x -> x_sb`
-- サブ帯域長が `1024` になることを確認
-
-## Step4
-
-サブ帯域内 beamforming 実装
-
-- `x_sb -> X_use`
-- 絶対周波数軸生成
-- steering / weights / sum
-- `Y_use -> y_use`
-
-## Step5
-
-合成フィルタバンク実装
-
-- `y_sb_full -> y`
-
-## Step6
-
-評価部実装
-
-- `y -> FFT`
-- `1000 Hz` 抽出
-- `Angle vs Level` 作図
-
-## Step7
-
-雑音付き確認
+1. `x -> x_sb -> y` で大きく破綻しないこと
+2. 1000 Hz, 60 deg 入力で 60 deg にピークが出ること
+3. RMS=1 入力でピークレベルが 0 dB 近傍に出ること
+4. `prototype_taps_per_band` を変えたときに速度と品質の変化を説明できること
+5. 途中でフル長 FFT を使わず処理が閉じていること
 
 ---
 
-# 14. 最低限の確認項目
+# 16. まとめ
 
-1. 解析->合成のみで入力波形がほぼ再現されること
-2. 1000 Hz, 60 deg 入力で 60 deg 付近にビームピークが出ること
-3. RMS=1 入力でピーク方位がほぼ 0 dB になること
-4. 雑音付きでもピークが大きく崩れないこと
-5. フル長 FFT を途中で使わずに処理が閉じていること
+MATLAB で今から作るべきものは、
 
----
-
-# 15. まとめ
-
-MATLAB で今から作るべきものは、現在の Python 簡易版の焼き直しではなく、
-
-- analysis polyphase DFT FB
-- decimated subband 時系列
+- 複素変調
+- 低域 FIR
+- decimation/interpolation
 - subband 内 FFT/BF/IFFT
-- synthesis polyphase DFT FB
 
 で最後まで閉じる実装である。
 
-この方式なら、理論確認だけでなく、本来狙っている計算量削減と構造上の一貫性を両立できる。
+この構成は、現在の Python 実装と一致しており、MATLAB 側でも同じ設計思想で再現できる。
